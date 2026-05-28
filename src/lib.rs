@@ -2,25 +2,30 @@
 //!
 //! ## Algorithm
 //!
-//! For each BAM file the BED regions are served via the BAM index. Reads whose
-//! alignment overlaps a region by at least `-f` fraction of the region length
-//! are counted. By default any 1-bp overlap qualifies (`-f 1e-9`).
+//! BED regions are sorted by chrom+start. For each BAM file, we scan each
+//! chromosome's reads in a single linear pass (one BAM index seek per chrom),
+//! using an event-sorted sweep to maintain the set of active regions as we
+//! advance through the BAM. This gives O(G × N/G × log(N/G)) total complexity
+//! where G is the chromosome count and N is the region count — essentially
+//! linear in the number of reads times the average region depth.
 //!
-//! Output: original BED columns + one read-count column per BAM, TSV.
+//! This is far more efficient than one BAM random-access query per region
+//! (which was the naive approach and cost 50k seeks for 50k regions).
 //!
 //! ## Read filtering (defaults match bedtools multicov)
 //!
 //! - Skip UNMAP (0x4), SECONDARY (0x100), QCFAIL (0x200), DUP (0x400).
 //! - Skip reads with MAPQ below the minimum.
 //! - `-s` / `-S` strand filters compare the read's strand to the BED strand
-//!   (column 6). Reads where the BED record has no strand column, or the strand
-//!   is `.`, are included regardless of strand filter.
+//!   (column 6). Reads where the BED record has no strand column, or the
+//!   strand is `.`, are included regardless of the strand filter.
 //!
 //! ## Reference
 //!
 //! `BEDTools multicov` — Quinlan & Hall (2010). Bioinformatics 26(6): 841–842.
 //! DOI: 10.1093/bioinformatics/btq033
 
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::Path;
@@ -150,24 +155,29 @@ pub fn multicov(
     let mut counts: Vec<Vec<u64>> = vec![vec![0u64; n_bams]; regions.len()];
 
     for (bam_idx, bam_path) in bam_paths.iter().enumerate() {
-        count_bam(bam_path.as_ref(), &regions, opts, &mut counts, bam_idx)?;
+        count_bam_sweep(bam_path.as_ref(), &regions, opts, &mut counts, bam_idx)?;
     }
 
     emit(output, &regions, &counts)
 }
 
-/// Per-region record pre-built from the BED region for the inner query loop.
-struct RegionKey {
-    ri: usize,
-    noodles_region: Region,
-    reg_start: u64,
-    reg_end: u64,
+/// Per-chrom region data for the sweep.
+struct ChromRegion {
+    ri: usize,  // index into the global regions Vec
+    start: u64, // 0-based
+    end: u64,   // exclusive
     reg_len: f64,
     strand: Option<bool>,
 }
 
+/// Count reads using a per-chromosome linear sweep instead of per-region seeks.
+///
+/// Regions are grouped by chromosome, sorted by start position. For each
+/// chrom we do one BAM index seek to the first region's start, then scan
+/// linearly: active regions (end > `read_start`) are kept; expired ones removed.
+/// Each read is tested only against the active region set.
 #[allow(clippy::too_many_lines)]
-fn count_bam(
+fn count_bam_sweep(
     bam_path: &Path,
     regions: &[BedRegion],
     opts: &MulticovOpts,
@@ -187,25 +197,25 @@ fn count_bam(
     let mut reader = bam::io::Reader::new(file);
     let header = reader.read_header().map_err(RsomicsError::Io)?;
 
-    let mut region_keys: Vec<RegionKey> = Vec::with_capacity(regions.len());
+    // Group regions by chrom, sorted by start within each chrom.
+    let mut chrom_map: HashMap<&str, Vec<ChromRegion>> = HashMap::new();
     for (ri, reg) in regions.iter().enumerate() {
-        let Ok(pos_start) = Position::try_from(reg.start as usize + 1) else {
-            continue;
-        };
-        let Ok(pos_end) = Position::try_from(reg.end as usize) else {
-            continue;
-        };
-        region_keys.push(RegionKey {
-            ri,
-            noodles_region: Region::new(reg.chrom.as_bytes(), pos_start..=pos_end),
-            reg_start: reg.start,
-            reg_end: reg.end,
-            reg_len: (reg.end - reg.start) as f64,
-            strand: reg.strand,
-        });
+        chrom_map
+            .entry(reg.chrom.as_str())
+            .or_default()
+            .push(ChromRegion {
+                ri,
+                start: reg.start,
+                end: reg.end,
+                reg_len: (reg.end - reg.start) as f64,
+                strand: reg.strand,
+            });
+    }
+    for v in chrom_map.values_mut() {
+        v.sort_unstable_by_key(|r| r.start);
     }
 
-    // Build the skip-flags mask.
+    // Build skip-flags mask.
     let mut skip_flags: u16 = 0x0104; // UNMAP(4) | SECONDARY(256)
     if !opts.include_failed_qc {
         skip_flags |= 0x200; // QCFAIL
@@ -216,10 +226,31 @@ fn count_bam(
 
     let mut record = bam::Record::default();
 
-    for key in &region_keys {
-        let Ok(mut query) = reader.query(&header, &index, &key.noodles_region) else {
+    // Process each chromosome independently.
+    for (chrom, mut chrom_regions) in chrom_map {
+        // Sort by start so we can sweep front to back.
+        chrom_regions.sort_unstable_by_key(|r| r.start);
+
+        // The scan start is the leftmost region's start (1-based for noodles).
+        let scan_start = chrom_regions[0].start + 1;
+        let Ok(pos_start) = Position::try_from(scan_start as usize) else {
+            continue;
+        };
+        // Scan to the rightmost region's end.
+        let scan_end = chrom_regions.iter().map(|r| r.end).max().unwrap_or(0);
+        let Ok(pos_end) = Position::try_from(scan_end as usize) else {
+            continue;
+        };
+
+        let noodles_region = Region::new(chrom.as_bytes(), pos_start..=pos_end);
+        let Ok(mut query) = reader.query(&header, &index, &noodles_region) else {
             continue; // chrom absent from BAM header
         };
+
+        // next_region_idx advances as the sweep position moves forward.
+        let mut next_region_idx = 0usize;
+        // active: regions whose end > current read_start.
+        let mut active: Vec<&ChromRegion> = Vec::new();
 
         loop {
             let n = query.read_record(&mut record).map_err(RsomicsError::Io)?;
@@ -228,35 +259,17 @@ fn count_bam(
             }
 
             let flags = record.flags().bits();
-
             if (flags & skip_flags) != 0 {
                 continue;
             }
-
             if opts.proper_pairs_only && (flags & 0x2) == 0 {
                 continue;
             }
-
             let mq = record.mapping_quality().map_or(0, |q| q.get());
             if mq < opts.min_mapq {
                 continue;
             }
 
-            // Strand filter: compare read strand against BED strand.
-            if let Some(require_same) = opts.strand_filter
-                && let Some(bed_plus) = key.strand
-            {
-                // bed_plus: true = '+' strand, false = '-' strand.
-                // read forward = FLAG REVERSE(0x10) NOT set.
-                let read_forward = (flags & 0x10) == 0;
-                // Same strand: bed+ and read-forward, or bed- and read-reverse.
-                let strands_same = bed_plus == read_forward;
-                if require_same != strands_same {
-                    continue;
-                }
-            }
-
-            // Compute the read's reference span (0-based half-open).
             let Some(aln_start_pos) = record.alignment_start().transpose().ok().flatten() else {
                 continue;
             };
@@ -267,25 +280,46 @@ fn count_bam(
             }
             let read_end = read_start + read_span;
 
-            // Overlap with the BED region.
-            let lo = read_start.max(key.reg_start);
-            let hi = read_end.min(key.reg_end);
-            if hi <= lo {
-                continue;
-            }
-            let overlap = (hi - lo) as f64;
-
-            // Fraction overlap vs region length.
-            if overlap / key.reg_len < opts.min_overlap_frac {
-                continue;
+            // Advance next_region_idx: add regions whose start <= read_end.
+            while next_region_idx < chrom_regions.len()
+                && chrom_regions[next_region_idx].start < read_end
+            {
+                active.push(&chrom_regions[next_region_idx]);
+                next_region_idx += 1;
             }
 
-            // Reciprocal: overlap must also be >= frac of read length.
-            if opts.reciprocal && overlap / (read_span as f64) < opts.min_overlap_frac {
-                continue;
-            }
+            // Remove expired regions (end <= read_start means no overlap).
+            active.retain(|r| r.end > read_start);
 
-            counts[key.ri][bam_idx] += 1;
+            // Check each active region for overlap.
+            for reg in &active {
+                let lo = read_start.max(reg.start);
+                let hi = read_end.min(reg.end);
+                if hi <= lo {
+                    continue;
+                }
+                let overlap = (hi - lo) as f64;
+
+                if overlap / reg.reg_len < opts.min_overlap_frac {
+                    continue;
+                }
+                if opts.reciprocal && overlap / (read_span as f64) < opts.min_overlap_frac {
+                    continue;
+                }
+
+                // Strand filter.
+                if let Some(require_same) = opts.strand_filter
+                    && let Some(bed_plus) = reg.strand
+                {
+                    let read_forward = (flags & 0x10) == 0;
+                    let strands_same = bed_plus == read_forward;
+                    if require_same != strands_same {
+                        continue;
+                    }
+                }
+
+                counts[reg.ri][bam_idx] += 1;
+            }
         }
     }
 
