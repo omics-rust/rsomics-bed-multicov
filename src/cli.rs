@@ -12,11 +12,6 @@ pub const META: ToolMeta = ToolMeta {
     version: env!("CARGO_PKG_VERSION"),
 };
 
-/// Count reads from multiple BAM files overlapping BED intervals.
-///
-/// Each input BAM must be coordinate-sorted and indexed (`.bam.bai`).
-/// Output preserves the BED columns with one read-count column appended
-/// per BAM.
 // Each bool maps directly to one bedtools multicov CLI flag.
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Parser, Debug)]

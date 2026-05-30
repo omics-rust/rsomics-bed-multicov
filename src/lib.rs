@@ -34,27 +34,19 @@ use noodles::bam;
 use noodles::core::{Position, Region};
 use rsomics_common::{Result, RsomicsError};
 
-/// Read filtering and counting options.
-// Each bool maps directly to one CLI flag; collapsing to an enum would be more
-// confusing than it's worth for a plain option struct.
+// Each bool maps directly to one CLI flag; collapsing to an enum would be
+// more confusing than it's worth for a plain option struct.
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Debug)]
 pub struct MulticovOpts {
-    /// Minimum mapping quality for a read to be counted.
     pub min_mapq: u8,
-    /// Include duplicate reads (FLAG 0x400). Default: false.
     pub include_dups: bool,
-    /// Include failed-QC reads (FLAG 0x200). Default: false.
     pub include_failed_qc: bool,
-    /// Only count properly-paired reads (FLAG 0x2 must be set). Default: false.
     pub proper_pairs_only: bool,
-    /// Minimum overlap as a fraction of the BED region length.
-    /// Default: 1e-9 (any 1-bp overlap qualifies).
+    /// 1e-9 by default (any 1-bp overlap qualifies).
     pub min_overlap_frac: f64,
-    /// Require reciprocal overlap: the read must also overlap the BED region
-    /// by at least `min_overlap_frac` of the *read* length. Default: false.
     pub reciprocal: bool,
-    /// Strand filter: None = any; Some(true) = same strand; Some(false) = opposite strand.
+    /// `None` = any strand; `Some(true)` = same; `Some(false)` = opposite.
     pub strand_filter: Option<bool>,
 }
 
@@ -197,7 +189,6 @@ fn count_bam_sweep(
     let mut reader = bam::io::Reader::new(file);
     let header = reader.read_header().map_err(RsomicsError::Io)?;
 
-    // Group regions by chrom, sorted by start within each chrom.
     let mut chrom_map: HashMap<&str, Vec<ChromRegion>> = HashMap::new();
     for (ri, reg) in regions.iter().enumerate() {
         chrom_map
@@ -215,7 +206,6 @@ fn count_bam_sweep(
         v.sort_unstable_by_key(|r| r.start);
     }
 
-    // Build skip-flags mask.
     let mut skip_flags: u16 = 0x0104; // UNMAP(4) | SECONDARY(256)
     if !opts.include_failed_qc {
         skip_flags |= 0x200; // QCFAIL
@@ -226,17 +216,13 @@ fn count_bam_sweep(
 
     let mut record = bam::Record::default();
 
-    // Process each chromosome independently.
     for (chrom, mut chrom_regions) in chrom_map {
-        // Sort by start so we can sweep front to back.
         chrom_regions.sort_unstable_by_key(|r| r.start);
 
-        // The scan start is the leftmost region's start (1-based for noodles).
-        let scan_start = chrom_regions[0].start + 1;
+        let scan_start = chrom_regions[0].start + 1; // 1-based for noodles
         let Ok(pos_start) = Position::try_from(scan_start as usize) else {
             continue;
         };
-        // Scan to the rightmost region's end.
         let scan_end = chrom_regions.iter().map(|r| r.end).max().unwrap_or(0);
         let Ok(pos_end) = Position::try_from(scan_end as usize) else {
             continue;
@@ -247,9 +233,7 @@ fn count_bam_sweep(
             continue; // chrom absent from BAM header
         };
 
-        // next_region_idx advances as the sweep position moves forward.
         let mut next_region_idx = 0usize;
-        // active: regions whose end > current read_start.
         let mut active: Vec<&ChromRegion> = Vec::new();
 
         loop {
@@ -280,18 +264,14 @@ fn count_bam_sweep(
             }
             let read_end = read_start + read_span;
 
-            // Advance next_region_idx: add regions whose start <= read_end.
             while next_region_idx < chrom_regions.len()
                 && chrom_regions[next_region_idx].start < read_end
             {
                 active.push(&chrom_regions[next_region_idx]);
                 next_region_idx += 1;
             }
-
-            // Remove expired regions (end <= read_start means no overlap).
             active.retain(|r| r.end > read_start);
 
-            // Check each active region for overlap.
             for reg in &active {
                 let lo = read_start.max(reg.start);
                 let hi = read_end.min(reg.end);
